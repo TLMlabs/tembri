@@ -1,5 +1,6 @@
 mod propamm_project;
 mod propamm_fetch;
+mod propamm_payments;
 mod propamm_report;
 
 use parquet::{

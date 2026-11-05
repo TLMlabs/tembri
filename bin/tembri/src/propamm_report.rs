@@ -10,7 +10,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use tlm_model::{
-    PropammBuilderSummary, PropammCexMarkout, PropammEvent, PropammEventKind,
+    PropammBuilderPayment, PropammBuilderSummary, PropammCexMarkout, PropammEvent, PropammEventKind,
     PropammFillPair, PropammPairingResult, PropammPeriodBlock, PropammRoute, PropammSandwich,
     PropammTakerClassSummary, PropammTakerFill, PropammTxRoute, RelayBlockReceipt, RelayStatus,
 };
@@ -150,6 +150,11 @@ struct Day<'a> {
     uniswap: &'a [PropammCexMarkout],
     relays: &'a [RelayStatus],
     receipts: &'a [RelayBlockReceipt],
+    /// Payments of each fill transaction to its block's builder; `None` when
+    /// Xatu native transfers are missing for the day.
+    payments: Option<&'a [PropammBuilderPayment]>,
+    /// ETH/USDT close at each period block's timestamp, for USD values.
+    eth_usd: &'a HashMap<u64, f64>,
     /// Markout of each fill (transaction, log index) at its block's first
     /// relay receipt.
     at_receipt: &'a HashMap<(String, u32), f64>,
@@ -264,6 +269,14 @@ fn run_day(settings: &Settings, date: &str) -> Result<PathBuf, String> {
     }
     let uniswap = tlm_classify::propamm_cex_markouts(&swaps, &period_blocks, &eth, &usdc)?;
 
+    // What fill transactions paid their block's builder.
+    let fill_tx_set: HashSet<String> = fill_txs.iter().map(|hash| hash.to_ascii_lowercase()).collect();
+    let payments = crate::propamm_payments::read_builder_payments(&plan, &fill_tx_set)?;
+    let eth_usd: HashMap<u64, f64> = period_blocks
+        .iter()
+        .filter_map(|block| Some((block.block_number, eth.price_at(block.timestamp?)?.0)))
+        .collect();
+
     // Relay receipts of the winning blocks with fills.
     let relay_day = settings.relay_dir.join(date);
     let relays: Vec<RelayStatus> = read_ndjson(&relay_day.join("relays.ndjson"))
@@ -301,6 +314,9 @@ fn run_day(settings: &Settings, date: &str) -> Result<PathBuf, String> {
     write_ndjson(&stage("routes"), &routes)?;
     write_ndjson(&stage("sandwiches"), &sandwiches)?;
     write_ndjson(&stage("uniswap_v3_markouts"), &uniswap)?;
+    if let Some(payments) = &payments {
+        write_ndjson(&stage("builder_payments"), payments)?;
+    }
     let markdown = render(&Day {
         date,
         traces: with_traces,
@@ -317,6 +333,8 @@ fn run_day(settings: &Settings, date: &str) -> Result<PathBuf, String> {
         uniswap: &uniswap,
         relays: &relays,
         receipts: &receipts,
+        payments: payments.as_deref(),
+        eth_usd: &eth_usd,
         at_receipt: &at_receipt,
         volatility_cuts_bp: settings.volatility_cuts_bp,
         size_cuts_usd: &settings.size_cuts_usd,
@@ -419,6 +437,8 @@ fn render<'a>(day: &Day<'a>) -> String {
             share(row.paired_fills as usize, row.fills as usize)
         );
     }
+
+    render_payments(&mut out, day);
 
     // Pairing.
     let _ = writeln!(out, "\n## Pairing\n\nA paired fill has an earlier update for its pool in the same block. Gaps are from that update to the fill.\n");
@@ -660,6 +680,84 @@ fn render<'a>(day: &Day<'a>) -> String {
     out
 }
 
+/// Totals of one group of fill transactions, in USD.
+#[derive(Default)]
+struct PaymentTotals {
+    txs: usize,
+    notional: f64,
+    priority_fee: f64,
+    direct: f64,
+    spread: f64,
+}
+
+/// What WETH/stablecoin fill transactions paid their block's builder,
+/// against the spread their fills paid makers at horizon 0.
+fn render_payments(out: &mut String, day: &Day) {
+    let _ = writeln!(out, "\n## Payments to builders\n");
+    let Some(payments) = day.payments else {
+        let _ = writeln!(out, "Not available: Xatu `native_transfers` is missing for some partitions of the day (`tembri fetch-xatu --datasets native_transfers`).");
+        return;
+    };
+    // Spread and notional of each transaction's WETH/stablecoin fills.
+    let mut fills: HashMap<&str, (f64, f64)> = HashMap::new();
+    for row in day.markouts {
+        if let Some(markout) = row.markout_0s_bp {
+            let entry = fills.entry(row.fill_tx_hash.as_str()).or_default();
+            entry.0 += row.stable_amount;
+            entry.1 += -markout / 1e4 * row.stable_amount;
+        }
+    }
+    let fills: HashMap<String, (f64, f64)> = fills.into_iter().map(|(hash, value)| (hash.to_ascii_lowercase(), value)).collect();
+    let mut all: BTreeMap<String, PaymentTotals> = BTreeMap::new();
+    let mut single: BTreeMap<String, PaymentTotals> = BTreeMap::new();
+    let mut unpriced = 0usize;
+    for payment in payments {
+        let Some(&(notional, spread)) = fills.get(&payment.tx_hash) else { continue };
+        let Some(&eth) = day.eth_usd.get(&payment.block_number) else {
+            unpriced += 1;
+            continue;
+        };
+        let to_usd = |wei: u128| wei as f64 / 1e18 * eth;
+        let builder = builder_label(payment.builder.as_deref());
+        let groups: &mut [&mut BTreeMap<String, PaymentTotals>] =
+            if payment.other_swap_logs == 0 { &mut [&mut all, &mut single] } else { &mut [&mut all] };
+        for group in groups.iter_mut() {
+            let totals = group.entry(builder.clone()).or_default();
+            totals.txs += 1;
+            totals.notional += notional;
+            totals.priority_fee += to_usd(payment.priority_fee_wei);
+            totals.direct += to_usd(payment.direct_transfer_wei);
+            totals.spread += spread;
+        }
+    }
+    let _ = writeln!(
+        out,
+        "WETH/stablecoin fill transactions. Priority fee = effective priority fee per gas x gas used. Direct transfers = ETH sent to the block's fee recipient inside the transaction (Xatu native transfers, including internal calls), excluding transfers from the fee recipient. ETH is valued at the Binance ETH/USDT price at the block. Spread = taker-signed horizon-0 CEX markout x notional. Payments cover the whole transaction, including any other swaps; the second table keeps transactions with no other swap log.{}\n",
+        if unpriced > 0 { format!(" {unpriced} transactions without a Binance price are left out.") } else { String::new() }
+    );
+    for (title, group) in [("All fill transactions", &all), ("Single-swap fill transactions", &single)] {
+        let _ = writeln!(out, "{title}:\n");
+        let _ = writeln!(out, "| Builder | Transactions | Notional (USD) | Priority fee (USD) | Direct transfers (USD) | Total to builder (USD) | Spread to makers (USD) | Total, bp of notional |\n|---|---:|---:|---:|---:|---:|---:|---:|");
+        let mut rows: Vec<_> = group.iter().collect();
+        rows.sort_by(|left, right| right.1.notional.total_cmp(&left.1.notional));
+        for (builder, totals) in rows {
+            let total = totals.priority_fee + totals.direct;
+            let _ = writeln!(
+                out,
+                "| {builder} | {} | {:.0} | {:.0} | {:.0} | {:.0} | {:.0} | {} |",
+                totals.txs,
+                totals.notional,
+                totals.priority_fee,
+                totals.direct,
+                total,
+                totals.spread,
+                bp((totals.notional > 0.0).then(|| total / totals.notional * 1e4))
+            );
+        }
+        let _ = writeln!(out);
+    }
+}
+
 fn group<T>(rows: &[T], key: impl Fn(&T) -> String) -> HashMap<String, Vec<&T>> {
     let mut groups: HashMap<String, Vec<&T>> = HashMap::new();
     for row in rows {
@@ -776,6 +874,20 @@ mod tests {
         let receipt = |received_ms| RelayBlockReceipt { block_number: 7, block_hash: "0xb".into(), relay: "a.example".into(), received_ms, error: None };
         let receipts = [receipt(Some(101_200)), receipt(Some(100_900))];
         let at_receipt = HashMap::from([(("0xfill".to_string(), 0), -0.7)]);
+        let payment = PropammBuilderPayment {
+            block_number: 7,
+            tx_hash: "0xfill".into(),
+            tx_position: 2,
+            builder: Some("titan".into()),
+            fee_recipient: "0xfee".into(),
+            gas_used: 1_000_000,
+            effective_priority_fee_per_gas: 2_000_000_000,
+            priority_fee_wei: 2_000_000_000_000_000,
+            direct_transfer_wei: 3_000_000_000_000_000,
+            direct_transfers: 1,
+            other_swap_logs: 0,
+        };
+        let eth_usd = HashMap::from([(7, 2000.0)]);
         let markdown = render(&Day {
             date: "2026-10-05",
             traces: false,
@@ -795,8 +907,10 @@ mod tests {
             at_receipt: &at_receipt,
             volatility_cuts_bp: [0.44, 0.72],
             size_cuts_usd: &[1000.0],
+            payments: Some(std::slice::from_ref(&payment)),
+            eth_usd: &eth_usd,
         });
-        for heading in ["## Activity by venue", "## Builders", "## Pairing", "## CEX markouts", "## Taker classes", "## Routes", "## Spreads", "## Uniswap V3 comparison", "## Sealing"] {
+        for heading in ["## Activity by venue", "## Builders", "## Pairing", "## CEX markouts", "## Taker classes", "## Routes", "## Spreads", "## Uniswap V3 comparison", "## Sealing", "## Payments to builders"] {
             assert!(markdown.contains(heading), "{heading}");
         }
         assert!(markdown.contains("| venue | 1 | 1 | 2000 |"));
@@ -809,5 +923,7 @@ mod tests {
         assert!(markdown.contains("Relays answering: a.example. Not answering: b.example."));
         assert!(markdown.contains("| all | 1 | 100.0% | 900 | 900 | 900 |"));
         assert!(markdown.contains("-0.50 at the block timestamp, -0.70 at the first receipt"));
+        // $4 priority fee and $6 direct transfer on $2000; spread 0.5 bp of $2000 = $0.10.
+        assert_eq!(markdown.matches("| titan | 1 | 2000 | 4 | 6 | 10 | 0 | 50.00 |").count(), 2);
     }
 }

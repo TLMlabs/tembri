@@ -5,6 +5,7 @@ pub mod cex_price;
 pub mod fee_fingerprint;
 pub mod lifecycle;
 pub mod markout;
+pub mod payment;
 pub mod propamm;
 pub mod reference_price;
 pub mod route;
@@ -18,6 +19,7 @@ pub use fee_fingerprint::{fingerprint_fee_fields, FeeFingerprint, FeeFingerprint
 pub use lifecycle::measure_mempool_lifecycle;
 pub use cex_price::{cex_markout_at, propamm_cex_markouts, CexSeries, CEX_HORIZONS_SECONDS, CEX_MAX_AGE_SECONDS};
 pub use markout::propamm_markouts;
+pub use payment::{effective_priority_fee_per_gas, propamm_builder_payments, NativeTransfer, PaymentBlock, PaymentTx, OTHER_SWAP_TOPICS};
 pub use route::{classify_propamm_routes, find_propamm_sandwiches};
 pub use uniswap::{uniswap_v3_fill, UniswapV3Pool};
 pub use taker::{classify_propamm_takers, summarize_taker_markouts, TAKER_CLASS_RANK};
