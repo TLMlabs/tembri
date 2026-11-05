@@ -1,6 +1,7 @@
 mod propamm_project;
 mod propamm_fetch;
 mod propamm_payments;
+mod propamm_period;
 mod propamm_report;
 
 use parquet::{
@@ -36,11 +37,12 @@ fn main() -> ExitCode {
         Some("propamm-routes") => propamm_routes(a.collect()),
         Some("propamm-fetch") => propamm_fetch::propamm_fetch_cmd(a.collect()),
         Some("propamm-report") => propamm_report::propamm_report_cmd(a.collect()),
+        Some("propamm-period") => propamm_period::propamm_period_cmd(a.collect()),
         Some("mempool-lifecycle") => mempool_lifecycle(a.collect()),
         Some("run-period") => run_period(a.collect()),
         Some("report") => report(a.collect()),
         _ => {
-            println!("Usage: tembri <fetch|fetch-xatu|fetch-cryo|classify|metrics|propamm-bytecode-group|propamm-project|propamm-decode|propamm-pair|propamm-markouts|propamm-cex-markouts|propamm-takers|propamm-routes|propamm-fetch|propamm-report|mempool-lifecycle|run-period|report> ...");
+            println!("Usage: tembri <fetch|fetch-xatu|fetch-cryo|classify|metrics|propamm-bytecode-group|propamm-project|propamm-decode|propamm-pair|propamm-markouts|propamm-cex-markouts|propamm-takers|propamm-routes|propamm-fetch|propamm-report|propamm-period|mempool-lifecycle|run-period|report> ...");
             ExitCode::from(2)
         }
     }

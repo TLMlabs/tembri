@@ -148,6 +148,8 @@ struct Day<'a> {
     volatility: &'a HashMap<u64, Option<f64>>,
     /// Uniswap V3 swaps outside fill transactions, priced as fills.
     uniswap: &'a [PropammCexMarkout],
+    /// Whether relay receipts were fetched for the day.
+    relay_available: bool,
     relays: &'a [RelayStatus],
     receipts: &'a [RelayBlockReceipt],
     /// Payments of each fill transaction to its block's builder; `None` when
@@ -278,10 +280,14 @@ fn run_day(settings: &Settings, date: &str) -> Result<PathBuf, String> {
         .collect();
 
     // Relay receipts of the winning blocks with fills.
+    // Optional: without them the Sealing section says so.
     let relay_day = settings.relay_dir.join(date);
-    let relays: Vec<RelayStatus> = read_ndjson(&relay_day.join("relays.ndjson"))
-        .map_err(|error| format!("{error}; run tembri propamm-fetch"))?;
-    let receipts: Vec<RelayBlockReceipt> = read_ndjson(&relay_day.join("receipts.ndjson"))?;
+    let relay_available = relay_day.join("relays.ndjson").is_file();
+    let (relays, receipts): (Vec<RelayStatus>, Vec<RelayBlockReceipt>) = if relay_available {
+        (read_ndjson(&relay_day.join("relays.ndjson"))?, read_ndjson(&relay_day.join("receipts.ndjson"))?)
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let mut received: HashMap<u64, u64> = HashMap::new();
     for receipt in &receipts {
         if let Some(time) = receipt.received_ms {
@@ -331,6 +337,7 @@ fn run_day(settings: &Settings, date: &str) -> Result<PathBuf, String> {
         sandwiches: &sandwiches,
         volatility: &volatility,
         uniswap: &uniswap,
+        relay_available,
         relays: &relays,
         receipts: &receipts,
         payments: payments.as_deref(),
@@ -625,6 +632,10 @@ fn render<'a>(day: &Day<'a>) -> String {
     }
 
     // Sealing.
+    if !day.relay_available {
+        let _ = writeln!(out, "\n## Sealing\n\nNot available: no relay receipts for this day (`tembri propamm-fetch`).");
+        return out;
+    }
     let answered: Vec<&str> = day.relays.iter().filter(|relay| relay.error.is_none()).map(|relay| relay.relay.as_str()).collect();
     let silent: Vec<&str> = day.relays.iter().filter(|relay| relay.error.is_some()).map(|relay| relay.relay.as_str()).collect();
     let failed = day.receipts.iter().filter(|receipt| receipt.error.is_some()).count();
@@ -698,9 +709,20 @@ fn render_payments(out: &mut String, day: &Day) {
         let _ = writeln!(out, "Not available: Xatu `native_transfers` is missing for some partitions of the day (`tembri fetch-xatu --datasets native_transfers`).");
         return;
     };
+    payment_tables(out, payments, day.markouts, day.eth_usd);
+}
+
+/// The two payment tables (all and single-swap fill transactions) for any
+/// set of days: `eth_usd` maps each block to its ETH/USDT price.
+pub(crate) fn payment_tables(
+    out: &mut String,
+    payments: &[PropammBuilderPayment],
+    markouts: &[PropammCexMarkout],
+    eth_usd: &HashMap<u64, f64>,
+) {
     // Spread and notional of each transaction's WETH/stablecoin fills.
     let mut fills: HashMap<&str, (f64, f64)> = HashMap::new();
-    for row in day.markouts {
+    for row in markouts {
         if let Some(markout) = row.markout_0s_bp {
             let entry = fills.entry(row.fill_tx_hash.as_str()).or_default();
             entry.0 += row.stable_amount;
@@ -713,7 +735,7 @@ fn render_payments(out: &mut String, day: &Day) {
     let mut unpriced = 0usize;
     for payment in payments {
         let Some(&(notional, spread)) = fills.get(&payment.tx_hash) else { continue };
-        let Some(&eth) = day.eth_usd.get(&payment.block_number) else {
+        let Some(&eth) = eth_usd.get(&payment.block_number) else {
             unpriced += 1;
             continue;
         };
@@ -888,7 +910,7 @@ mod tests {
             other_swap_logs: 0,
         };
         let eth_usd = HashMap::from([(7, 2000.0)]);
-        let markdown = render(&Day {
+        let day = Day {
             date: "2026-10-05",
             traces: false,
             period: &period,
@@ -902,6 +924,7 @@ mod tests {
             sandwiches: &[],
             volatility: &volatility,
             uniswap: &[swap],
+            relay_available: true,
             relays: &relays,
             receipts: &receipts,
             at_receipt: &at_receipt,
@@ -909,7 +932,11 @@ mod tests {
             size_cuts_usd: &[1000.0],
             payments: Some(std::slice::from_ref(&payment)),
             eth_usd: &eth_usd,
-        });
+        };
+        let markdown = render(&day);
+        let without_relays = render(&Day { relay_available: false, payments: None, ..day });
+        assert!(without_relays.contains("## Sealing\n\nNot available: no relay receipts"));
+        assert!(without_relays.contains("## Payments to builders\n\nNot available: Xatu `native_transfers`"));
         for heading in ["## Activity by venue", "## Builders", "## Pairing", "## CEX markouts", "## Taker classes", "## Routes", "## Spreads", "## Uniswap V3 comparison", "## Sealing", "## Payments to builders"] {
             assert!(markdown.contains(heading), "{heading}");
         }

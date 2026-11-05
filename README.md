@@ -57,7 +57,7 @@ cargo run -p tembri -- --help
 The CLI currently exposes:
 
 ```text
-tembri <fetch|fetch-xatu|fetch-cryo|classify|metrics|propamm-bytecode-group|propamm-project|propamm-decode|propamm-pair|mempool-lifecycle|run-period|report>
+tembri <fetch|fetch-xatu|fetch-cryo|classify|metrics|propamm-bytecode-group|propamm-project|propamm-decode|propamm-pair|propamm-report|propamm-period|mempool-lifecycle|run-period|report>
 ```
 
 ## Run an execution report
