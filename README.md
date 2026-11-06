@@ -49,7 +49,7 @@ Tembri is a Rust toolbox for reproducible Ethereum execution and mempool measure
 Prerequisites: a recent stable Rust toolchain and enough local disk for cached Parquet data.
 
 ```bash
-git clone https://github.com/TLM-Research/tembri.git
+git clone https://github.com/TLMlabs/tembri.git
 cd tembri
 cargo run -p tembri -- --help
 ```
