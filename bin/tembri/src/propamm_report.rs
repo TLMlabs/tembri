@@ -37,9 +37,9 @@ pub(crate) struct Settings {
     min_blocks: usize,
     pub relays: Vec<String>,
     uniswap_v3_pools: Vec<tlm_classify::UniswapV3Pool>,
-    volatility_window_s: u64,
-    volatility_cuts_bp: [f64; 2],
-    size_cuts_usd: Vec<f64>,
+    pub volatility_window_s: u64,
+    pub volatility_cuts_bp: [f64; 2],
+    pub size_cuts_usd: Vec<f64>,
     pub dates: Vec<String>,
 }
 
@@ -160,7 +160,7 @@ struct Day<'a> {
     /// Markout of each fill (transaction, log index) at its block's first
     /// relay receipt.
     at_receipt: &'a HashMap<(String, u32), f64>,
-    volatility_cuts_bp: [f64; 2],
+    pub volatility_cuts_bp: [f64; 2],
     size_cuts_usd: &'a [f64],
 }
 

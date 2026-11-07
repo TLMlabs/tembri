@@ -152,6 +152,44 @@ fn order_test(groups: &[Vec<Place>], total: bool, select: impl Fn(&Place) -> boo
     test
 }
 
+/// Fills that trade after an earlier fill on the same market in their block,
+/// and so against the state that fill left. Counted over all fills, with or
+/// without payment rows, by fill and by transaction (a transaction counts
+/// once per market-block, at its first fill).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SharedUpdates {
+    pub fills: usize,
+    pub later_fills: usize,
+    pub transactions: usize,
+    pub later_transactions: usize,
+    /// Market-blocks with two or more transactions.
+    pub contested_market_blocks: usize,
+}
+
+pub fn propamm_shared_updates(events: &[PropammEvent]) -> SharedUpdates {
+    let mut groups: HashMap<MarketBlock, (usize, Vec<String>)> = HashMap::new();
+    for event in events.iter().filter(|event| event.kind == PropammEventKind::Fill) {
+        let Some(terms) = &event.fill else { continue };
+        let (a, b) = (terms.token_in.to_ascii_lowercase(), terms.token_out.to_ascii_lowercase());
+        let pair = if a <= b { (a, b) } else { (b, a) };
+        let entry = groups.entry((event.block_number, event.venue.as_str(), pair.0, pair.1)).or_default();
+        entry.0 += 1;
+        let hash = event.tx_hash.to_ascii_lowercase();
+        if !entry.1.contains(&hash) {
+            entry.1.push(hash);
+        }
+    }
+    let mut shared = SharedUpdates::default();
+    for (fills, txs) in groups.values() {
+        shared.fills += fills;
+        shared.later_fills += fills - 1;
+        shared.transactions += txs.len();
+        shared.later_transactions += txs.len() - 1;
+        shared.contested_market_blocks += usize::from(txs.len() > 1);
+    }
+    shared
+}
+
 /// The order tests after a PropAMM update.
 pub fn propamm_position_tests(events: &[PropammEvent], payments: &[PropammBuilderPayment]) -> PositionTests {
     let groups = market_blocks(events, payments);
@@ -237,6 +275,24 @@ mod tests {
             direct_transfers: 0,
             other_swap_logs: other_swaps,
         }
+    }
+
+    #[test]
+    fn shared_updates_count_later_fills_and_transactions_per_market_block() {
+        // Block 1, one market (pair in either direction): tx a with two fills, then tx b.
+        // Block 1, another venue: tx c alone. Block 2: tx d alone on the first market.
+        let events = [
+            fill(1, "0xa", 1, "v", ("x", "y")),
+            fill(1, "0xA", 2, "v", ("y", "x")),
+            fill(1, "0xb", 3, "v", ("x", "y")),
+            fill(1, "0xc", 4, "w", ("x", "y")),
+            fill(2, "0xd", 1, "v", ("x", "y")),
+        ];
+        let shared = propamm_shared_updates(&events);
+        assert_eq!(
+            shared,
+            SharedUpdates { fills: 5, later_fills: 2, transactions: 4, later_transactions: 1, contested_market_blocks: 1 }
+        );
     }
 
     #[test]
