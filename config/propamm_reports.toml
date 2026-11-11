@@ -30,7 +30,10 @@ registry = "0xda7afeed021eafc1c1af9c362de477dad0396b81"
 # auto: use Xatu traces when every partition of the day has them;
 # required: fail without them (propamm-fetch then fetches them);
 # off: top-level registry calls only.
-traces = "auto"
+# Off since 2026-11-11: traces are now on disk for 2026-09-10..2026-10-09 (for
+# propamm-pool-calls), and the existing stages were written without them.
+# "auto" would add internal registry updates on any rerun of those days.
+traces = "off"
 
 # Refuse partial days.
 min_blocks_per_day = 6500

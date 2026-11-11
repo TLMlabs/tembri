@@ -624,6 +624,27 @@ pub struct PropammBuilderPayment {
     pub other_swap_logs: u32,
 }
 
+/// A `call` frame into a reviewed PropAMM pool, from Xatu traces. Static and
+/// delegate calls are left out: they read state or run pool code elsewhere.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PropammPoolCall {
+    pub block_number: BlockNumber,
+    pub tx_hash: String,
+    pub tx_position: u32,
+    /// The frame's caller: the transaction's `to` contract or an inner contract.
+    pub caller: String,
+    pub pool: String,
+    pub venue: String,
+    pub reverted: bool,
+    /// Receipt status of the whole transaction. A reverted frame inside a
+    /// successful transaction was caught by its caller.
+    pub tx_succeeded: bool,
+    /// Revert reason of a reverted frame: `Error("...")`, `Panic(0x..)`, a
+    /// named custom error, or its 4-byte selector when the name is unknown.
+    #[serde(default)]
+    pub revert_reason: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MempoolLifecycleStatus {
     Admitted,
