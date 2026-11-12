@@ -190,6 +190,15 @@ pub fn propamm_shared_updates(events: &[PropammEvent]) -> SharedUpdates {
     shared
 }
 
+/// `propamm_shared_updates` per venue.
+pub fn propamm_shared_updates_by_venue(events: &[PropammEvent]) -> BTreeMap<String, SharedUpdates> {
+    let mut by_venue: BTreeMap<String, Vec<PropammEvent>> = BTreeMap::new();
+    for event in events.iter().filter(|event| event.kind == PropammEventKind::Fill) {
+        by_venue.entry(event.venue.clone()).or_default().push(event.clone());
+    }
+    by_venue.into_iter().map(|(venue, events)| (venue, propamm_shared_updates(&events))).collect()
+}
+
 /// The order tests after a PropAMM update.
 pub fn propamm_position_tests(events: &[PropammEvent], payments: &[PropammBuilderPayment]) -> PositionTests {
     let groups = market_blocks(events, payments);
@@ -198,6 +207,50 @@ pub fn propamm_position_tests(events: &[PropammEvent], payments: &[PropammBuilde
         total: order_test(&groups, true, |_| true),
         total_single_swap: order_test(&groups, true, |place| place.single_swap),
     }
+}
+
+/// The order test of one venue, with the median payment per gas by place.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct VenueOrder {
+    /// Total payment, all contested market-blocks of the venue.
+    pub total: OrderTest,
+    /// Total payment, market-blocks whose first transaction is single-swap.
+    pub total_single_swap: OrderTest,
+    /// In contested market-blocks whose first transaction is single-swap:
+    /// median payment per gas (gwei) of single-swap transactions at place 1,
+    /// 2, and 3 or later, with their counts.
+    pub single_swap_place_gwei: [Option<f64>; 3],
+    pub single_swap_place_counts: [usize; 3],
+}
+
+/// `propamm_position_tests` per venue.
+pub fn propamm_position_tests_by_venue(events: &[PropammEvent], payments: &[PropammBuilderPayment]) -> BTreeMap<String, VenueOrder> {
+    let mut by_venue: BTreeMap<String, Vec<Vec<Place>>> = BTreeMap::new();
+    for places in market_blocks(events, payments) {
+        if let Some(head) = places.first() {
+            by_venue.entry(head.venue.clone()).or_default().push(places);
+        }
+    }
+    by_venue
+        .into_iter()
+        .map(|(venue, groups)| {
+            let mut by_place: [Vec<f64>; 3] = Default::default();
+            for places in groups.iter().filter(|places| places.len() >= 2 && places[0].single_swap) {
+                for (index, place) in places.iter().enumerate().filter(|(_, place)| place.single_swap) {
+                    by_place[index.min(2)].push(place.per_gas_gwei(true));
+                }
+            }
+            let single_swap_place_counts = [by_place[0].len(), by_place[1].len(), by_place[2].len()];
+            let [first, second, later] = &mut by_place;
+            let order = VenueOrder {
+                total: order_test(&groups, true, |_| true),
+                total_single_swap: order_test(&groups, true, |place| place.single_swap),
+                single_swap_place_gwei: [median(first), median(second), median(later)],
+                single_swap_place_counts,
+            };
+            (venue, order)
+        })
+        .collect()
 }
 
 /// The value of the first place after an update, by builder.
@@ -293,6 +346,8 @@ mod tests {
             shared,
             SharedUpdates { fills: 5, later_fills: 2, transactions: 4, later_transactions: 1, contested_market_blocks: 1 }
         );
+        let venues = propamm_shared_updates_by_venue(&events);
+        assert_eq!((venues["v"].transactions, venues["v"].later_transactions, venues["w"].transactions), (3, 1, 1));
     }
 
     #[test]
@@ -324,5 +379,38 @@ mod tests {
         let value = &propamm_early_place_value(&events, &payments, &eth)[&Some("titan".to_string())];
         assert_eq!((value.fill_transactions, value.contested_first_places), (5, 1));
         assert!((value.premium_usd - 3e-9 * 100_000.0 * 2000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn splits_the_order_test_by_venue_with_single_swap_places() {
+        // kipseli block 1: a (single-swap, 6 gwei/gas), b (not single-swap, 2), c (single-swap, 2).
+        // fermiswap block 1: d alone. fermiswap block 3: e (1 gwei/gas) then f (4), both single-swap.
+        let events = [
+            fill(1, "0xa", 1, "kipseli", ("0xweth", "0xusdc")),
+            fill(1, "0xb", 4, "kipseli", ("0xusdc", "0xweth")),
+            fill(1, "0xc", 9, "kipseli", ("0xweth", "0xusdc")),
+            fill(1, "0xd", 2, "fermiswap", ("0xweth", "0xusdc")),
+            fill(3, "0xe", 1, "fermiswap", ("0xweth", "0xusdc")),
+            fill(3, "0xf", 2, "fermiswap", ("0xweth", "0xusdc")),
+        ];
+        let payments = [
+            paid(1, "0xa", 1, 5, 0),
+            paid(1, "0xb", 2, 0, 1),
+            paid(1, "0xc", 2, 0, 0),
+            paid(1, "0xd", 1, 0, 0),
+            paid(3, "0xe", 1, 0, 0),
+            paid(3, "0xf", 4, 0, 0),
+        ];
+        let venues = propamm_position_tests_by_venue(&events, &payments);
+        assert_eq!(venues.keys().map(String::as_str).collect::<Vec<_>>(), ["fermiswap", "kipseli"]);
+        let kipseli = &venues["kipseli"];
+        assert_eq!((kipseli.total.market_blocks, kipseli.total.earlier_pays_more, kipseli.total.equal), (1, 1, 1));
+        // Place 2 is not single-swap, so it is left out of the place medians; c is place 3.
+        assert_eq!(kipseli.single_swap_place_counts, [1, 0, 1]);
+        assert_eq!(kipseli.single_swap_place_gwei, [Some(6.0), None, Some(2.0)]);
+        let fermiswap = &venues["fermiswap"];
+        assert_eq!((fermiswap.total.market_blocks, fermiswap.total.earlier_pays_less), (1, 1));
+        assert_eq!(fermiswap.total.median_solo_gwei, Some(1.0));
+        assert_eq!(fermiswap.single_swap_place_gwei, [Some(1.0), Some(4.0), None]);
     }
 }

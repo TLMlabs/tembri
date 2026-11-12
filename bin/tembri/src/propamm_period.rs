@@ -9,10 +9,10 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use tlm_model::{PropammBuilderPayment, PropammCexMarkout, PropammEvent, PropammEventKind, PropammPeriodBlock};
+use tlm_model::{PropammBuilderPayment, PropammCexMarkout, PropammEvent, PropammEventKind, PropammPeriodBlock, PropammPoolCall};
 
 /// Every date from `from` to `to`, inclusive.
-fn date_range(from: &str, to: &str) -> Result<Vec<String>, String> {
+pub(crate) fn date_range(from: &str, to: &str) -> Result<Vec<String>, String> {
     let parse = |value: &str| chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| format!("invalid date {value}"));
     let (mut day, last) = (parse(from)?, parse(to)?);
     if day > last {
@@ -69,6 +69,8 @@ fn run_period(settings: &Settings, dates: &[String]) -> Result<PathBuf, String> 
     let mut eth_usd: HashMap<u64, f64> = HashMap::new();
     let mut daily: Vec<DayMarkouts> = Vec::new();
     let mut volatility: HashMap<u64, Option<f64>> = HashMap::new();
+    let mut pool_calls: Vec<PropammPoolCall> = Vec::new();
+    let mut pool_call_days: Vec<&str> = Vec::new();
     let [eth_symbol, _] = KLINE_SYMBOLS;
     for date in dates {
         let dir = output_dir.join(date);
@@ -77,6 +79,10 @@ fn run_period(settings: &Settings, dates: &[String]) -> Result<PathBuf, String> 
             return Err(format!("{} is missing; run tembri propamm-report for {date} with Xatu native transfers", stage("builder_payments").display()));
         }
         payments.extend(read_ndjson::<PropammBuilderPayment>(&stage("builder_payments"))?);
+        if stage("pool_calls").is_file() {
+            pool_calls.extend(read_ndjson::<PropammPoolCall>(&stage("pool_calls"))?);
+            pool_call_days.push(date);
+        }
         let day_markouts: Vec<PropammCexMarkout> = read_ndjson(&stage("cex_markouts"))?;
         fills.extend(read_ndjson::<PropammEvent>(&stage("events"))?.into_iter().filter(|event| event.kind == PropammEventKind::Fill));
         let blocks: Vec<PropammPeriodBlock> = read_ndjson(&stage("period_blocks"))?;
@@ -114,6 +120,9 @@ fn run_period(settings: &Settings, dates: &[String]) -> Result<PathBuf, String> 
     render_position(&mut out, &fills, &payments, &eth_usd);
     render_taker_cost(&mut out, &markouts, &daily, &volatility, settings.volatility_cuts_bp);
     render_cost_by_size(&mut out, &markouts, &settings.size_cuts_usd);
+    render_price_by_place(&mut out, &markouts, &settings.size_cuts_usd);
+    render_payment_by_place(&mut out, &fills, &payments);
+    render_pool_calls(&mut out, &pool_calls, &fills, &pool_call_days, dates.len());
     let path = output_dir.join(format!("propamm_period_{first}_{last}.md"));
     fs::write(&path, out).map_err(|error| format!("{}: {error}", path.display()))?;
     Ok(path)
@@ -338,6 +347,185 @@ fn render_cost_by_size(out: &mut String, markouts: &[PropammCexMarkout], cuts: &
             bp(band.mean_cost_bp),
             bp(band.weighted_cost_bp)
         );
+    }
+    let _ = writeln!(out);
+}
+
+fn bp2(value: Option<f64>) -> String {
+    value.map_or("n/a".into(), |value| format!("{value:.3}"))
+}
+
+/// A fitted term as `estimate (se)`, or `-` when the regressor did not vary.
+fn term(value: Option<(f64, f64)>) -> String {
+    value.map_or("-".into(), |(estimate, se)| format!("{estimate:+.3} ({se:.3})"))
+}
+
+/// How a later fill's price compares with the first fill's in its block, per venue.
+fn render_price_by_place(out: &mut String, markouts: &[PropammCexMarkout], cuts: &[f64]) {
+    let later = tlm_classify::propamm_later_fills(markouts);
+    let summaries = tlm_classify::summarize_price_gaps(&later, cuts);
+    let scale = tlm_classify::GAP_FIT_SCALE_USD;
+    let _ = writeln!(
+        out,
+        "## Price by place\n\nWETH/stablecoin fills. A market-block here is one block, pool and stablecoin; its first fill sets the side. A later fill is a fill on the same side in a transaction with no earlier fill in the market-block (fills that share a transaction with an earlier one are a split order; their notional counts as taken). Gap: the later fill's price against the first fill's, in bp, positive when the later fill paid more. Same price: within {} bp.\n",
+        tlm_classify::SAME_PRICE_BP
+    );
+    let _ = writeln!(out, "| Venue | Later fills | Median gap | Mean | Weighted by own notional | Same price |\n|---|---:|---:|---:|---:|---:|");
+    for (venue, summary) in &summaries {
+        let share = summary.same_price_share.map_or("n/a".into(), |share| format!("{:.0}%", 100.0 * share));
+        let _ = writeln!(
+            out,
+            "| {venue} | {} | {} | {} | {} | {share} |",
+            summary.all.fills,
+            bp2(summary.all.median_bp),
+            bp2(summary.all.mean_bp),
+            bp2(summary.weighted_bp)
+        );
+    }
+    let _ = writeln!(
+        out,
+        "\nLeast squares per venue: gap = a + b own + c first + d earlier same side + e earlier other side, notional per ${scale:.0}; estimate (standard error). A dash: the regressor did not vary. At fixed own size, d is the cost of the notional already taken.\n"
+    );
+    let _ = writeln!(out, "| Venue | a | b own | c first | d earlier same side | e earlier other side |\n|---|---:|---:|---:|---:|---:|");
+    for (venue, summary) in &summaries {
+        match &summary.fit {
+            Some(fit) => {
+                let [a, b, c, d, e] = fit.terms;
+                let _ = writeln!(out, "| {venue} | {} | {} | {} | {} | {} |", term(a), term(b), term(c), term(d), term(e));
+            }
+            None => {
+                let _ = writeln!(out, "| {venue} | too few fills | | | | |");
+            }
+        }
+    }
+    let _ = writeln!(out, "\nBy place (2, 3, 4 or later) and by earlier same-side notional: later fills, median gap, mean gap.\n");
+    let names: Vec<&str> = summaries.values().next().map(|summary| summary.by_prior.iter().map(|(name, _)| name.as_str()).collect()).unwrap_or_default();
+    let _ = write!(out, "| Venue | Place 2 | Place 3 | Place 4+ |");
+    for name in &names {
+        let _ = write!(out, " Earlier {name} |");
+    }
+    let _ = writeln!(out, "\n|---|---:|---:|---:|{}", "---:|".repeat(names.len()));
+    let cell = |stats: &tlm_classify::GapStats| {
+        if stats.fills == 0 { "-".to_string() } else { format!("{}: {} / {}", stats.fills, bp2(stats.median_bp), bp2(stats.mean_bp)) }
+    };
+    for (venue, summary) in &summaries {
+        let _ = write!(out, "| {venue} |");
+        for stats in summary.by_place.iter().chain(summary.by_prior.iter().map(|(_, stats)| stats)) {
+            let _ = write!(out, " {} |", cell(stats));
+        }
+        let _ = writeln!(out);
+    }
+    let _ = writeln!(out);
+}
+
+/// The order test per venue, and payment per gas by place.
+fn render_payment_by_place(out: &mut String, fills: &[PropammEvent], payments: &[PropammBuilderPayment]) {
+    let venues = tlm_classify::propamm_position_tests_by_venue(fills, payments);
+    let _ = writeln!(
+        out,
+        "## Payment by place\n\nThe order test of \"Order after the update\" per venue (total payment per gas; market-blocks by venue and unordered pair). Place medians: in contested market-blocks whose first transaction is single-swap, single-swap transactions only, in gwei per gas (count in brackets).\n"
+    );
+    let _ = writeln!(
+        out,
+        "| Venue | Contested market-blocks | Pairs | Earlier pays more | Less | Equal | Single-swap first: pairs | Earlier more | Less | Place 1 | Place 2 | Place 3+ |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+    );
+    for (venue, order) in &venues {
+        let (all, single) = (&order.total, &order.total_single_swap);
+        let place = |index: usize| format!("{} ({})", gwei(order.single_swap_place_gwei[index]), order.single_swap_place_counts[index]);
+        let _ = writeln!(
+            out,
+            "| {venue} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            all.market_blocks,
+            all.neighbour_pairs,
+            percent(all.earlier_pays_more, all.neighbour_pairs),
+            percent(all.earlier_pays_less, all.neighbour_pairs),
+            percent(all.equal, all.neighbour_pairs),
+            single.neighbour_pairs,
+            percent(single.earlier_pays_more, single.neighbour_pairs),
+            percent(single.earlier_pays_less, single.neighbour_pairs),
+            place(0),
+            place(1),
+            place(2)
+        );
+    }
+    let _ = writeln!(out);
+}
+
+/// Calls into PropAMM pools and their reverts, on the days with a pool-calls stage.
+fn render_pool_calls(out: &mut String, calls: &[PropammPoolCall], fills: &[PropammEvent], days: &[&str], all_days: usize) {
+    let _ = writeln!(out, "## Calls into pools\n");
+    if days.is_empty() {
+        let _ = writeln!(out, "No `pool_calls` stage for these days; run `tembri propamm-pool-calls` after fetching Xatu traces.\n");
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "`call` frames into reviewed PropAMM pools, from Xatu traces ({} of {all_days} days have the stage). Caught: the frame reverted but its transaction succeeded. After a fill: a reverted frame in a transaction after an earlier fill on that pool in the block; with a fill: in a transaction that also filled on that pool. Builders drop most transactions that would fail before inclusion, so failed transactions are a lower bound; caught reverts inside included transactions are all seen.\n",
+        days.len()
+    );
+    let summaries = tlm_classify::summarize_pool_calls(calls, fills);
+    let _ = writeln!(out, "| Venue | Calls | Reverted | Caught | No fill on the pool in the block | After a fill | With a fill | Top reasons |\n|---|---:|---:|---:|---:|---:|---:|---|");
+    let top = |reasons: &std::collections::BTreeMap<String, usize>, n: usize| {
+        let mut rows: Vec<(&String, &usize)> = reasons.iter().collect();
+        rows.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        rows.iter().take(n).map(|(reason, count)| format!("{} {count}", reason.replace('|', "/"))).collect::<Vec<_>>().join("; ")
+    };
+    for (venue, summary) in &summaries {
+        let _ = writeln!(
+            out,
+            "| {venue} | {} | {} | {} | {} | {} | {} | {} |",
+            summary.calls,
+            summary.reverted,
+            summary.caught,
+            summary.by_place.no_fill_in_block,
+            summary.by_place.after_fill,
+            summary.by_place.with_fill,
+            top(&summary.reasons, 3)
+        );
+    }
+    let shared = tlm_classify::propamm_shared_updates_by_venue(fills);
+    let _ = writeln!(
+        out,
+        "\nRefusals for depth: reverted frames whose reason is {}, by place against fills on the same pool in the block, next to the venue's fill transactions after an earlier one in their market-block (\"Order after the update\", per venue).\n",
+        tlm_classify::DEPTH_REASONS.join(" or ")
+    );
+    let _ = writeln!(out, "| Venue | Later fill transactions | Depth refusals | No fill in the block | Before the first fill | With a fill | After a fill | Of which transaction succeeded |\n|---|---:|---:|---:|---:|---:|---:|---:|");
+    let mut depth_success: HashMap<&str, usize> = HashMap::new();
+    for call in calls.iter().filter(|call| call.reverted && call.tx_succeeded) {
+        if call.revert_reason.as_deref().is_some_and(|reason| tlm_classify::DEPTH_REASONS.contains(&reason)) {
+            *depth_success.entry(call.venue.as_str()).or_default() += 1;
+        }
+    }
+    for (venue, summary) in summaries.iter().filter(|(_, summary)| summary.depth != tlm_classify::ByPlace::default()) {
+        let depth = summary.depth;
+        let total = depth.no_fill_in_block + depth.before_first_fill + depth.with_fill + depth.after_fill;
+        let _ = writeln!(
+            out,
+            "| {venue} | {} | {total} | {} | {} | {} | {} | {} |",
+            shared.get(venue).map_or(0, |shared| shared.later_transactions),
+            depth.no_fill_in_block,
+            depth.before_first_fill,
+            depth.with_fill,
+            depth.after_fill,
+            depth_success.get(venue.as_str()).copied().unwrap_or(0)
+        );
+    }
+    let _ = writeln!(out, "\nReasons of reverts after or with a fill on the same pool:\n");
+    let _ = writeln!(out, "| Venue | Reasons |\n|---|---|");
+    for (venue, summary) in summaries.iter().filter(|(_, summary)| !summary.late_reasons.is_empty()) {
+        let _ = writeln!(out, "| {venue} | {} |", top(&summary.late_reasons, 8));
+    }
+    let mut callers: HashMap<&str, usize> = HashMap::new();
+    for call in calls.iter().filter(|call| call.reverted) {
+        *callers.entry(call.caller.as_str()).or_default() += 1;
+    }
+    let reverted: usize = callers.values().sum();
+    let mut callers: Vec<(&str, usize)> = callers.into_iter().collect();
+    callers.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let _ = writeln!(out, "\nCallers of reverted frames ({reverted} frames, {} callers); the largest:\n", callers.len());
+    let _ = writeln!(out, "| Caller | Reverted frames | Share |\n|---|---:|---:|");
+    for (caller, count) in callers.iter().take(5) {
+        let _ = writeln!(out, "| {caller} | {count} | {} |", percent(*count, reverted));
     }
     let _ = writeln!(out);
 }

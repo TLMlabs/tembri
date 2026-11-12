@@ -6,6 +6,7 @@ pub mod fee_fingerprint;
 pub mod lifecycle;
 pub mod markout;
 pub mod payment;
+pub mod place;
 pub mod position;
 pub mod propamm;
 pub mod reference_price;
@@ -21,7 +22,12 @@ pub use lifecycle::measure_mempool_lifecycle;
 pub use cex_price::{cex_markout_at, propamm_cex_markouts, CexSeries, CEX_HORIZONS_SECONDS, CEX_MAX_AGE_SECONDS};
 pub use markout::propamm_markouts;
 pub use position::{
-    propamm_early_place_value, propamm_position_tests, propamm_shared_updates, EarlyPlaceValue, OrderTest, PositionTests, SharedUpdates,
+    propamm_early_place_value, propamm_position_tests, propamm_position_tests_by_venue, propamm_shared_updates, propamm_shared_updates_by_venue, EarlyPlaceValue, OrderTest, PositionTests,
+    SharedUpdates, VenueOrder,
+};
+pub use place::{
+    fit_price_gap, propamm_later_fills, ByPlace, DEPTH_REASONS, revert_reason, summarize_pool_calls, summarize_price_gaps, GapFit, GapStats, GapSummary, LaterFill, PoolCallSummary,
+    GAP_FIT_SCALE_USD, SAME_PRICE_BP,
 };
 pub use payment::{effective_priority_fee_per_gas, propamm_builder_payments, NativeTransfer, PaymentBlock, PaymentTx, OTHER_SWAP_TOPICS};
 pub use route::{classify_propamm_routes, find_propamm_sandwiches};
