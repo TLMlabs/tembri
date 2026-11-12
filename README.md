@@ -18,6 +18,7 @@ Tembri is a Rust toolbox for reproducible Ethereum execution and mempool measure
 - Report builder signals derived from block `extra_data`, including block share, transaction volume, zero-tip transactions, mean tip, mean position, and tip/position correlation.
 - Ingest public-mempool observation and admission files and derive conservative lifecycle outcomes: first seen, admitted, and sender/nonce replacement before admission.
 - Decode reviewed PropAMM fill logs and Priority Update Registry signed-batch calls into typed update/fill rows; pair each fill only with an earlier update for the same block and pool.
+- Measure what PropAMM fill transactions pay their block's builder: effective priority fee plus direct ETH transfers to the fee recipient (Xatu native transfers), against the spread paid to makers, by builder, in the daily PropAMM report.
 
 ## Important boundaries
 
@@ -28,7 +29,7 @@ Tembri is a Rust toolbox for reproducible Ethereum execution and mempool measure
 | Public/private flow | Requires a compatible mempool archive joined to execution data; this join is not yet included in the activity-tip report. |
 | Mempool lifecycle | Supported when observation and admission NDJSON inputs are supplied. Coverage depends on the archive and its schema. |
 | Activity labels | Evidence-based heuristics, not a complete protocol taxonomy. “Arbitrage candidate” is deliberately conservative. |
-| Traces and direct payments | Fetch support exists, but direct builder-payment and full trace-flow analysis are still planned. |
+| Traces and direct payments | Direct ETH payments to the fee recipient are measured for PropAMM fill transactions (`propamm-report`, `adr/2026-11-05-propamm-builder-payments.md`). Payments in other tokens are not counted. Full trace-flow analysis for other transactions is still planned. |
 | Market-volatility regimes | Planned. |
 | PropAMM coverage | The decoder is rule-driven. Only reviewed address/topic rules and explicitly allow-listed registry targets are decoded; it does not discover venues or infer fills from generic transfers. |
 | PropAMM pairing | A pair proves receipt order in a block, not that an update was the newest off-chain quote or that a builder received it first. |
@@ -48,7 +49,7 @@ Tembri is a Rust toolbox for reproducible Ethereum execution and mempool measure
 Prerequisites: a recent stable Rust toolchain and enough local disk for cached Parquet data.
 
 ```bash
-git clone https://github.com/TLM-Research/tembri.git
+git clone https://github.com/TLMlabs/tembri.git
 cd tembri
 cargo run -p tembri -- --help
 ```
@@ -56,7 +57,7 @@ cargo run -p tembri -- --help
 The CLI currently exposes:
 
 ```text
-tembri <fetch|fetch-xatu|fetch-cryo|classify|metrics|propamm-bytecode-group|propamm-project|propamm-decode|propamm-pair|mempool-lifecycle|run-period|report>
+tembri <fetch|fetch-xatu|fetch-cryo|classify|metrics|propamm-bytecode-group|propamm-project|propamm-decode|propamm-pair|propamm-report|propamm-period|mempool-lifecycle|run-period|report>
 ```
 
 ## Run an execution report

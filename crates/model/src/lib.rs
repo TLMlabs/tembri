@@ -598,6 +598,32 @@ pub struct PropammBuilderSummary {
     pub fills_without_update: u32,
 }
 
+/// What one PropAMM fill transaction paid the builder of its block: the
+/// EIP-1559 priority fee, and ETH sent to the block's fee recipient inside
+/// the transaction (direct transfers, including internal calls). Transfers
+/// sent by the fee recipient itself are excluded, so a builder's payment to
+/// the proposer is not counted. Amounts are in wei.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PropammBuilderPayment {
+    pub block_number: BlockNumber,
+    pub tx_hash: String,
+    pub tx_position: u32,
+    pub builder: Option<String>,
+    /// The block's `author` (fee recipient).
+    pub fee_recipient: String,
+    pub gas_used: u64,
+    /// Type 2 and later: min(max priority fee, max fee - base fee); legacy:
+    /// gas price - base fee.
+    pub effective_priority_fee_per_gas: u64,
+    pub priority_fee_wei: u128,
+    pub direct_transfer_wei: u128,
+    /// Number of transfers to the fee recipient counted in `direct_transfer_wei`.
+    pub direct_transfers: u32,
+    /// Swap logs in the transaction other than PropAMM fills (Uniswap V2,
+    /// V3 and V4, Curve, Balancer V2). Zero means a single-swap transaction.
+    pub other_swap_logs: u32,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MempoolLifecycleStatus {
     Admitted,

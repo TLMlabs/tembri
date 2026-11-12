@@ -405,7 +405,7 @@ pub(crate) fn read_block_hashes(path: &PathBuf) -> Result<Vec<(u64, u64, String)
 
 /// Resolve Xatu columns by name: physical positions differ between schema
 /// versions (see the base-fee fix of 2026-10-29).
-fn columns(reader: &SerializedFileReader<File>, path: &Path, names: &[&str]) -> Result<Vec<usize>, String> {
+pub(crate) fn columns(reader: &SerializedFileReader<File>, path: &Path, names: &[&str]) -> Result<Vec<usize>, String> {
     let schema = reader.metadata().file_metadata().schema_descr();
     names
         .iter()
