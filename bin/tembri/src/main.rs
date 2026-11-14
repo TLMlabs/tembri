@@ -1291,52 +1291,155 @@ fn activity_tip_report(input: &PathBuf, out: &PathBuf) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{base_fee_column_index, validated_base_fee};
+    use super::{builder_name, client_version_label, read_xatu_blocks, validated_base_fee, xatu_block_columns, XatuBlockColumns};
+    use parquet::basic::Type as Physical;
+    use parquet::column::writer::ColumnWriter;
+    use parquet::data_type::{ByteArray, FixedLenByteArray};
+    use parquet::file::writer::SerializedFileWriter;
+    use parquet::schema::parser::parse_message_type;
+    use std::sync::Arc;
 
-    #[test]
-    fn finds_base_fee_by_name_in_legacy_xatu_block_schema() {
-        let fields = [
-            ("slot", true),
-            ("proposer_index", true),
-            ("block_number", true),
-            ("block_hash", false),
-            ("parent_hash", false),
-            ("gas_used", true),
-            ("gas_limit", true),
-            ("extra_data", false),
-            ("base_fee_per_gas", true),
-            ("meta_network_id", true),
-        ];
-        assert_eq!(base_fee_column_index(&fields), Ok(8));
+    /// Xatu `canonical_execution_block`, 11-column layout (2025 partitions).
+    const ELEVEN: &str = "message schema {
+        REQUIRED INT32 updated_date_time (INTEGER(32,false));
+        REQUIRED INT64 block_date_time (TIMESTAMP(MILLIS,true));
+        REQUIRED INT64 block_number (INTEGER(64,false));
+        REQUIRED FIXED_LEN_BYTE_ARRAY (66) block_hash;
+        REQUIRED BYTE_ARRAY author;
+        REQUIRED INT64 gas_used (INTEGER(64,false));
+        REQUIRED BYTE_ARRAY extra_data;
+        REQUIRED BYTE_ARRAY extra_data_string;
+        REQUIRED INT64 base_fee_per_gas (INTEGER(64,false));
+        REQUIRED INT32 meta_network_id;
+        REQUIRED BYTE_ARRAY meta_network_name;
+    }";
+
+    /// The 12-column layout (2026 partitions): `gas_limit` after `gas_used`.
+    const TWELVE: &str = "message schema {
+        REQUIRED INT32 updated_date_time (INTEGER(32,false));
+        REQUIRED INT64 block_date_time (TIMESTAMP(MILLIS,true));
+        REQUIRED INT64 block_number (INTEGER(64,false));
+        REQUIRED FIXED_LEN_BYTE_ARRAY (66) block_hash;
+        REQUIRED BYTE_ARRAY author;
+        REQUIRED INT64 gas_used (INTEGER(64,false));
+        REQUIRED INT64 gas_limit (INTEGER(64,false));
+        REQUIRED BYTE_ARRAY extra_data;
+        REQUIRED BYTE_ARRAY extra_data_string;
+        REQUIRED INT64 base_fee_per_gas (INTEGER(64,false));
+        REQUIRED INT32 meta_network_id;
+        REQUIRED BYTE_ARRAY meta_network_name;
+    }";
+
+    /// Block 22,820,690 (0x47f861e4...afa19): extraData is a geth version
+    /// record that is not valid UTF-8 as raw bytes.
+    const EXTRA_HEX: &str = "0xd883010f0b846765746888676f312e32342e32856c696e7578";
+    const EXTRA_RAW: &[u8] = b"\xd8\x83\x01\x0f\x0b\x84geth\x88go1.24.2\x85linux";
+
+    fn fields(message: &str) -> Vec<(String, Physical)> {
+        parse_message_type(message)
+            .unwrap()
+            .get_fields()
+            .iter()
+            .map(|field| (field.name().to_string(), field.get_physical_type()))
+            .collect()
+    }
+
+    fn columns(message: &str) -> Result<XatuBlockColumns, String> {
+        let fields = fields(message);
+        let borrowed: Vec<(&str, Physical)> = fields.iter().map(|(name, kind)| (name.as_str(), *kind)).collect();
+        xatu_block_columns(&borrowed)
+    }
+
+    /// Writes block 22,820,690 as one row in the given layout.
+    fn write_block(message: &str, path: &std::path::Path) {
+        let schema = Arc::new(parse_message_type(message).unwrap());
+        let names: Vec<String> = schema.get_fields().iter().map(|field| field.name().to_string()).collect();
+        let mut writer = SerializedFileWriter::new(std::fs::File::create(path).unwrap(), schema, Default::default()).unwrap();
+        let mut group = writer.next_row_group().unwrap();
+        let mut index = 0;
+        while let Some(mut column) = group.next_column().unwrap() {
+            let name = names[index].as_str();
+            index += 1;
+            match column.untyped() {
+                ColumnWriter::Int32ColumnWriter(w) => {
+                    w.write_batch(&[1], None, None).unwrap();
+                }
+                ColumnWriter::Int64ColumnWriter(w) => {
+                    let value = match name {
+                        "block_number" => 22_820_690,
+                        "gas_used" => 5_458_242,
+                        "gas_limit" => 36_000_000,
+                        "base_fee_per_gas" => 693_802_607,
+                        _ => 1,
+                    };
+                    w.write_batch(&[value], None, None).unwrap();
+                }
+                ColumnWriter::FixedLenByteArrayColumnWriter(w) => {
+                    let hash = b"0x47f861e4d973385aba932012210cbc043a86563ac0046cbb9560706ed9aafa19".to_vec();
+                    w.write_batch(&[FixedLenByteArray::from(hash)], None, None).unwrap();
+                }
+                ColumnWriter::ByteArrayColumnWriter(w) => {
+                    let value: &[u8] = match name {
+                        "extra_data" => EXTRA_HEX.as_bytes(),
+                        "extra_data_string" => EXTRA_RAW,
+                        _ => b"mainnet",
+                    };
+                    w.write_batch(&[ByteArray::from(value.to_vec())], None, None).unwrap();
+                }
+                _ => unreachable!("no other column types in the Xatu block layouts"),
+            }
+            column.close().unwrap();
+        }
+        group.close().unwrap();
+        writer.close().unwrap();
     }
 
     #[test]
-    fn finds_base_fee_by_name_in_current_xatu_block_schema() {
-        let fields = [
-            ("slot", true),
-            ("proposer_index", true),
-            ("block_number", true),
-            ("block_hash", false),
-            ("parent_hash", false),
-            ("gas_used", true),
-            ("gas_limit", true),
-            ("extra_data", false),
-            ("extra_data_string", false),
-            ("base_fee_per_gas", true),
-        ];
-        assert_eq!(base_fee_column_index(&fields), Ok(9));
+    fn finds_block_columns_by_name_in_both_xatu_layouts() {
+        assert_eq!(columns(ELEVEN), Ok(XatuBlockColumns { number: 2, gas_used: 5, extra_data: 6, base_fee: 8 }));
+        assert_eq!(columns(TWELVE), Ok(XatuBlockColumns { number: 2, gas_used: 5, extra_data: 7, base_fee: 9 }));
     }
 
     #[test]
-    fn rejects_missing_or_incompatible_base_fee_field() {
-        assert!(base_fee_column_index(&[("meta_network_id", true)]).is_err());
-        assert!(base_fee_column_index(&[("base_fee_per_gas", false)]).is_err());
+    fn rejects_missing_or_incompatible_block_columns() {
+        assert!(xatu_block_columns(&[("meta_network_id", Physical::INT32)]).is_err());
+        let wrong_type = TWELVE.replace("REQUIRED INT64 base_fee_per_gas (INTEGER(64,false))", "REQUIRED BYTE_ARRAY base_fee_per_gas");
+        assert!(columns(&wrong_type).unwrap_err().contains("base_fee_per_gas"));
+        let no_extra = ELEVEN.replace("REQUIRED BYTE_ARRAY extra_data;", "");
+        assert!(columns(&no_extra).unwrap_err().contains("extra_data"));
     }
 
     #[test]
     fn rejects_zero_base_fee() {
         assert!(validated_base_fee(0).is_err());
         assert_eq!(validated_base_fee(1), Ok(1));
+    }
+
+    #[test]
+    fn decodes_client_version_records() {
+        assert_eq!(builder_name(EXTRA_HEX.into()), "geth/v1.15.11/go1.24.2/linux");
+        assert_eq!(client_version_label(EXTRA_RAW).as_deref(), Some("geth/v1.15.11/go1.24.2/linux"));
+        // Text extraData is unchanged; hex that is neither text nor a record stays hex.
+        assert_eq!(builder_name("0x6275696c6465726e6574".into()), "buildernet");
+        assert_eq!(builder_name("0xd8ff".into()), "0xd8ff");
+        assert_eq!(client_version_label(b"\xc2\x01\x80"), None);
+        assert_eq!(client_version_label(b"\xd0\x01"), None);
+    }
+
+    #[test]
+    fn builder_signal_is_the_same_in_both_layouts_for_block_22820690() {
+        let dir = std::env::temp_dir().join(format!("tembri-xatu-blocks-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, message) in [("eleven", ELEVEN), ("twelve", TWELVE)] {
+            let path = dir.join(format!("{name}.parquet"));
+            write_block(message, &path);
+            let blocks = read_xatu_blocks(&path, &|_| true).unwrap();
+            let block = &blocks[&22_820_690];
+            assert_eq!(block.builder_signal, "geth/v1.15.11/go1.24.2/linux", "{name} layout");
+            assert_eq!((block.gas_used, block.base_fee), (5_458_242, 693_802_607), "{name} layout");
+            assert!(read_xatu_blocks(&path, &|number| number != 22_820_690).unwrap().is_empty());
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
 
@@ -1551,10 +1654,62 @@ fn builder_name(raw: String) -> String {
             .collect();
         bytes.and_then(|b| String::from_utf8(b).ok())
     });
+    let decoded = decoded.or_else(|| {
+        let value = hex?;
+        let bytes: Vec<u8> = (0..value.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&value[i..i + 2], 16).ok())
+            .collect::<Option<_>>()?;
+        client_version_label(&bytes)
+    });
     decoded
         .unwrap_or(raw)
         .trim_matches(char::from(0))
         .to_ascii_lowercase()
+}
+/// The execution-client version record that geth-style clients write into
+/// extraData when they build a block themselves: an RLP list of a packed
+/// version (major, minor, patch bytes) and short text fields, e.g.
+/// `[0x010f0b, "geth", "go1.24.2", "linux"]` -> `geth/v1.15.11/go1.24.2/linux`.
+/// Anything else returns None.
+fn client_version_label(bytes: &[u8]) -> Option<String> {
+    let (&head, body) = bytes.split_first()?;
+    if !(0xc0..=0xf7).contains(&head) || body.len() != usize::from(head - 0xc0) {
+        return None;
+    }
+    let mut items = Vec::new();
+    let mut rest = body;
+    while let Some((&prefix, tail)) = rest.split_first() {
+        let (item, next) = match prefix {
+            0x00..=0x7f => rest.split_at(1),
+            0x80..=0xb7 => {
+                let length = usize::from(prefix - 0x80);
+                if tail.len() < length {
+                    return None;
+                }
+                tail.split_at(length)
+            }
+            _ => return None,
+        };
+        items.push(item);
+        rest = next;
+    }
+    let (version, fields) = items.split_first()?;
+    if version.is_empty() || version.len() > 4 || fields.is_empty() {
+        return None;
+    }
+    let fields = fields
+        .iter()
+        .map(|field| {
+            std::str::from_utf8(field)
+                .ok()
+                .filter(|text| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_graphic()))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let version = version.iter().map(|byte| byte.to_string()).collect::<Vec<_>>().join(".");
+    let mut parts = vec![fields[0].to_string(), format!("v{version}")];
+    parts.extend(fields[1..].iter().map(|field| field.to_string()));
+    Some(parts.join("/"))
 }
 fn parquet_u64(row: &parquet::record::Row, col: usize) -> Result<u64, String> {
     row.get_ulong(col)
@@ -1601,35 +1756,72 @@ fn xatu_reader(path: &PathBuf) -> Result<SerializedFileReader<File>, String> {
 /// Resolve this field by its stable schema name. Xatu's historical block schemas
 /// place it at different physical positions, so a positional lookup can silently
 /// read `meta_network_id` as a base fee.
-fn base_fee_column_index(columns: &[(&str, bool)]) -> Result<usize, String> {
-    let Some((index, (_, is_int64))) = columns
-        .iter()
-        .enumerate()
-        .find(|(_, (name, _))| *name == "base_fee_per_gas")
-    else {
-        return Err("Xatu blocks schema is missing base_fee_per_gas".into());
-    };
-    if !is_int64 {
-        return Err("Xatu blocks base_fee_per_gas must have INT64 physical type".into());
-    }
-    Ok(index)
+/// Column positions in a Xatu `canonical_execution_block` file, found by name.
+/// Xatu has shipped two layouts: 11 columns (`extra_data` at 6,
+/// `extra_data_string` at 7, `base_fee_per_gas` at 8) and 12 columns
+/// (`gas_limit` added at 6, so each of those moves up by one).
+#[derive(Debug, PartialEq)]
+struct XatuBlockColumns {
+    number: usize,
+    gas_used: usize,
+    extra_data: usize,
+    base_fee: usize,
 }
 
-fn xatu_base_fee_column(reader: &SerializedFileReader<File>) -> Result<usize, String> {
-    let columns: Vec<_> = reader
+fn xatu_block_columns(columns: &[(&str, ParquetPhysicalType)]) -> Result<XatuBlockColumns, String> {
+    let find = |name: &str, kind: ParquetPhysicalType| -> Result<usize, String> {
+        let (index, (_, actual)) = columns
+            .iter()
+            .enumerate()
+            .find(|(_, (column, _))| *column == name)
+            .ok_or_else(|| format!("Xatu blocks schema is missing {name}"))?;
+        if *actual != kind {
+            return Err(format!("Xatu blocks {name} must have {kind:?} physical type"));
+        }
+        Ok(index)
+    };
+    Ok(XatuBlockColumns {
+        number: find("block_number", ParquetPhysicalType::INT64)?,
+        gas_used: find("gas_used", ParquetPhysicalType::INT64)?,
+        extra_data: find("extra_data", ParquetPhysicalType::BYTE_ARRAY)?,
+        base_fee: find("base_fee_per_gas", ParquetPhysicalType::INT64)?,
+    })
+}
+
+/// Blocks of one Xatu blocks file, keeping the numbers `selected` accepts.
+/// The builder signal comes from `extra_data` (0x hex in both layouts), never
+/// from `extra_data_string`, whose raw bytes need not be UTF-8.
+fn read_xatu_blocks(path: &PathBuf, selected: &dyn Fn(u64) -> bool) -> Result<HashMap<u64, XatuBlock>, String> {
+    let reader = xatu_reader(path)?;
+    let schema: Vec<_> = reader
         .metadata()
         .file_metadata()
         .schema_descr()
         .columns()
         .iter()
-        .map(|column| {
-            (
-                column.name(),
-                column.physical_type() == ParquetPhysicalType::INT64,
-            )
-        })
+        .map(|column| (column.name(), column.physical_type()))
         .collect();
-    base_fee_column_index(&columns)
+    let columns = xatu_block_columns(&schema).map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut blocks = HashMap::new();
+    for row in reader.get_row_iter(None).map_err(|e| e.to_string())? {
+        let row = row.map_err(|e| e.to_string())?;
+        let number = parquet_u64(&row, columns.number)?;
+        if !selected(number) {
+            continue;
+        }
+        blocks.insert(
+            number,
+            XatuBlock {
+                gas_used: parquet_u64(&row, columns.gas_used).unwrap_or(0),
+                base_fee: validated_base_fee(parquet_u64(&row, columns.base_fee)?)?,
+                builder_signal: parquet_text(&row, columns.extra_data)
+                    .map(builder_name)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "unknown".into()),
+            },
+        );
+    }
+    Ok(blocks)
 }
 
 fn validated_base_fee(value: u64) -> Result<u64, String> {
@@ -1669,31 +1861,9 @@ fn xatu_evidence(
 
 fn activity_tip_xatu_report(plan: &tlm_report::ReportPlan, out: &PathBuf) -> Result<(), String> {
     let mut blocks: HashMap<u64, XatuBlock> = HashMap::new();
+    let selected = |number: u64| plan.block_numbers.as_ref().is_none_or(|selected| selected.contains(&number));
     for path in xatu_plan_files(plan, "blocks")? {
-        let reader = xatu_reader(&path)?;
-        let base_fee_column = xatu_base_fee_column(&reader)?;
-        for row in reader.get_row_iter(None).map_err(|e| e.to_string())? {
-            let row = row.map_err(|e| e.to_string())?;
-            let number = parquet_u64(&row, 2)?;
-            if plan
-                .block_numbers
-                .as_ref()
-                .is_some_and(|selected| !selected.contains(&number))
-            {
-                continue;
-            }
-            blocks.insert(
-                number,
-                XatuBlock {
-                    gas_used: parquet_u64(&row, 5).unwrap_or(0),
-                    base_fee: validated_base_fee(parquet_u64(&row, base_fee_column)?)?,
-                    builder_signal: parquet_text(&row, 7)
-                        .map(builder_name)
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or_else(|| "unknown".into()),
-                },
-            );
-        }
+        blocks.extend(read_xatu_blocks(&path, &selected)?);
     }
     let mut groups: std::collections::BTreeMap<String, ActivityStats> =
         std::collections::BTreeMap::new();
