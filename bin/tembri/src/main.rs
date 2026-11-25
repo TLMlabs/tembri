@@ -1330,6 +1330,20 @@ mod tests {
         REQUIRED BYTE_ARRAY meta_network_name;
     }";
 
+    /// The 16-column layout (from partition 26230000): four columns appended
+    /// after `meta_network_name`.
+    fn sixteen() -> String {
+        TWELVE.replace(
+            "REQUIRED BYTE_ARRAY meta_network_name;\n    }",
+            "REQUIRED BYTE_ARRAY meta_network_name;
+        REQUIRED FIXED_LEN_BYTE_ARRAY (66) parent_hash;
+        REQUIRED FIXED_LEN_BYTE_ARRAY (66) state_root;
+        REQUIRED INT64 blob_gas_used (INTEGER(64,false));
+        REQUIRED INT64 excess_blob_gas (INTEGER(64,false));
+    }",
+        )
+    }
+
     /// Block 22,820,690 (0x47f861e4...afa19): extraData is a geth version
     /// record that is not valid UTF-8 as raw bytes.
     const EXTRA_HEX: &str = "0xd883010f0b846765746888676f312e32342e32856c696e7578";
@@ -1395,9 +1409,11 @@ mod tests {
     }
 
     #[test]
-    fn finds_block_columns_by_name_in_both_xatu_layouts() {
+    fn finds_block_columns_by_name_in_all_xatu_layouts() {
         assert_eq!(columns(ELEVEN), Ok(XatuBlockColumns { number: 2, gas_used: 5, extra_data: 6, base_fee: 8 }));
         assert_eq!(columns(TWELVE), Ok(XatuBlockColumns { number: 2, gas_used: 5, extra_data: 7, base_fee: 9 }));
+        assert_eq!(fields(&sixteen()).len(), 16);
+        assert_eq!(columns(&sixteen()), Ok(XatuBlockColumns { number: 2, gas_used: 5, extra_data: 7, base_fee: 9 }));
     }
 
     #[test]
@@ -1427,10 +1443,11 @@ mod tests {
     }
 
     #[test]
-    fn builder_signal_is_the_same_in_both_layouts_for_block_22820690() {
+    fn builder_signal_is_the_same_in_all_layouts_for_block_22820690() {
         let dir = std::env::temp_dir().join(format!("tembri-xatu-blocks-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        for (name, message) in [("eleven", ELEVEN), ("twelve", TWELVE)] {
+        for (name, message) in [("eleven", ELEVEN.to_string()), ("twelve", TWELVE.to_string()), ("sixteen", sixteen())] {
+            let message = message.as_str();
             let path = dir.join(format!("{name}.parquet"));
             write_block(message, &path);
             let blocks = read_xatu_blocks(&path, &|_| true).unwrap();
@@ -1757,9 +1774,10 @@ fn xatu_reader(path: &PathBuf) -> Result<SerializedFileReader<File>, String> {
 /// place it at different physical positions, so a positional lookup can silently
 /// read `meta_network_id` as a base fee.
 /// Column positions in a Xatu `canonical_execution_block` file, found by name.
-/// Xatu has shipped two layouts: 11 columns (`extra_data` at 6,
-/// `extra_data_string` at 7, `base_fee_per_gas` at 8) and 12 columns
-/// (`gas_limit` added at 6, so each of those moves up by one).
+/// Xatu has shipped three layouts: 11 columns (`extra_data` at 6,
+/// `extra_data_string` at 7, `base_fee_per_gas` at 8), 12 columns
+/// (`gas_limit` added at 6, so each of those moves up by one), and from
+/// partition 26230000, 16 columns (four appended at the end).
 #[derive(Debug, PartialEq)]
 struct XatuBlockColumns {
     number: usize,
